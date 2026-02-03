@@ -1,3 +1,9 @@
+// エラー/ステータス表示用ヘルパー
+function showStatus(message, isError = true) {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="status ${isError ? 'error' : 'info'}">${message}</div>`;
+}
+
 // YouTube動画のURLを収集するスクリプト
 const collectVideosScript = () => {
   const videos = new Map();
@@ -63,6 +69,69 @@ const collectVideosScript = () => {
     return null;
   };
 
+  // 日付テキストをパースしてDateオブジェクトに変換
+  const parseDateText = (text) => {
+    if (!text) return null;
+    const now = new Date();
+
+    // 「X時間前」「X日前」「X週間前」「X か月前」「X年前」などをパース
+    const patterns = [
+      { regex: /(\d+)\s*(秒|second)/i, unit: 'seconds' },
+      { regex: /(\d+)\s*(分|minute)/i, unit: 'minutes' },
+      { regex: /(\d+)\s*(時間|hour)/i, unit: 'hours' },
+      { regex: /(\d+)\s*(日|day)/i, unit: 'days' },
+      { regex: /(\d+)\s*(週間?|week)/i, unit: 'weeks' },
+      { regex: /(\d+)\s*(か月|ヶ月|カ月|month)/i, unit: 'months' },
+      { regex: /(\d+)\s*(年|year)/i, unit: 'years' },
+    ];
+
+    for (const { regex, unit } of patterns) {
+      const match = text.match(regex);
+      if (match) {
+        const value = parseInt(match[1], 10);
+        const date = new Date(now);
+        switch (unit) {
+          case 'seconds': date.setSeconds(date.getSeconds() - value); break;
+          case 'minutes': date.setMinutes(date.getMinutes() - value); break;
+          case 'hours': date.setHours(date.getHours() - value); break;
+          case 'days': date.setDate(date.getDate() - value); break;
+          case 'weeks': date.setDate(date.getDate() - value * 7); break;
+          case 'months': date.setMonth(date.getMonth() - value); break;
+          case 'years': date.setFullYear(date.getFullYear() - value); break;
+        }
+        return date.getTime();
+      }
+    }
+    return null;
+  };
+
+  // 日付テキストを抽出
+  const extractDate = (container) => {
+    if (!container) return null;
+
+    // メタデータ行から日付を探す
+    const metadataSelectors = [
+      '#metadata-line span',
+      '.ytd-video-meta-block span',
+      '#metadata span',
+      '.metadata-line span',
+      '[class*="metadata"] span',
+    ];
+
+    for (const selector of metadataSelectors) {
+      const spans = container.querySelectorAll(selector);
+      for (const span of spans) {
+        const text = span.textContent?.trim() || '';
+        // 「前」「ago」を含むテキストを探す
+        if (text.match(/(前|ago)/i)) {
+          const parsed = parseDateText(text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+    return null;
+  };
+
   // 現在視聴中の動画
   const currentUrl = window.location.href;
   if (currentUrl.includes('/watch?v=')) {
@@ -76,7 +145,12 @@ const collectVideosScript = () => {
         || document.querySelector('#title h1')?.textContent?.trim()
         || document.querySelector('meta[name="title"]')?.getAttribute('content')
         || document.title.replace(' - YouTube', '');
-      videos.set(videoId, { id: videoId, title, url: `https://www.youtube.com/watch?v=${videoId}` });
+
+      // 視聴ページの投稿日を取得
+      const dateText = document.querySelector('#info-strings yt-formatted-string')?.textContent?.trim();
+      const publishDate = parseDateText(dateText);
+
+      videos.set(videoId, { id: videoId, title, url: `https://www.youtube.com/watch?v=${videoId}`, publishDate });
     }
   }
 
@@ -120,7 +194,10 @@ const collectVideosScript = () => {
           title = title.substring(0, 77) + '...';
         }
 
-        videos.set(videoId, { id: videoId, title, url: `https://www.youtube.com/watch?v=${videoId}` });
+        // 日付情報を取得
+        const publishDate = extractDate(container);
+
+        videos.set(videoId, { id: videoId, title, url: `https://www.youtube.com/watch?v=${videoId}`, publishDate });
       }
     } catch (e) {
       // URLパースエラーは無視
@@ -130,36 +207,120 @@ const collectVideosScript = () => {
   return Array.from(videos.values());
 };
 
-// 動画リストを表示
-function renderVideoList(videos) {
-  const content = document.getElementById('content');
+// グローバルに全動画を保持（フィルター用）
+let allVideos = [];
+
+// 日付フィルターの定義
+const DATE_FILTERS = {
+  all: { label: 'すべて', days: null },
+  today: { label: '今日', days: 1 },
+  week: { label: '1週間', days: 7 },
+  month: { label: '1か月', days: 30 },
+  year: { label: '1年', days: 365 },
+};
+
+// フィルター適用
+function applyFilters() {
+  const keyword = document.getElementById('keywordFilter')?.value?.toLowerCase() || '';
+  const dateFilter = document.getElementById('dateFilter')?.value || 'all';
+
+  const now = Date.now();
+  const filterDays = DATE_FILTERS[dateFilter]?.days;
+
+  const filtered = allVideos.filter(video => {
+    // キーワードフィルター
+    if (keyword && !video.title.toLowerCase().includes(keyword)) {
+      return false;
+    }
+
+    // 日付フィルター
+    if (filterDays && video.publishDate) {
+      const diffDays = (now - video.publishDate) / (1000 * 60 * 60 * 24);
+      if (diffDays > filterDays) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  renderFilteredList(filtered);
+}
+
+// フィルター済みリストを描画
+function renderFilteredList(videos) {
+  const listContainer = document.getElementById('videoListContainer');
+  const countDisplay = document.getElementById('filteredCount');
+
+  if (countDisplay) {
+    countDisplay.textContent = `${videos.length}/${allVideos.length}件`;
+  }
+
+  if (!listContainer) return;
 
   if (videos.length === 0) {
-    content.innerHTML = `
-      <div class="status error">
-        YouTubeの動画が見つかりませんでした。<br>
-        YouTubeページで使用してください。
-      </div>
-    `;
+    listContainer.innerHTML = '<div class="no-results">該当する動画がありません</div>';
     return;
   }
 
+  let html = '';
+  videos.forEach((video, index) => {
+    html += `
+      <div class="video-item">
+        <input type="checkbox" id="video-${index}" data-url="${video.url}" checked>
+        <span class="video-title" data-url="${video.url}" title="${video.title}">${video.title}</span>
+      </div>
+    `;
+  });
+
+  listContainer.innerHTML = html;
+
+  // タイトルクリックで動画ページを開く（バックグラウンドで開く）
+  document.querySelectorAll('.video-title').forEach(title => {
+    title.addEventListener('click', () => {
+      chrome.tabs.create({ url: title.dataset.url, active: false });
+    });
+  });
+}
+
+// 動画リストを表示
+function renderVideoList(videos) {
+  allVideos = videos;
+
+  if (videos.length === 0) {
+    showStatus('YouTubeの動画が見つかりませんでした。<br>YouTubeページで使用してください。');
+    return;
+  }
+
+  const content = document.getElementById('content');
+
+  // 日付オプションを生成
+  const dateOptions = Object.entries(DATE_FILTERS)
+    .map(([value, { label }]) => `<option value="${value}">${label}</option>`)
+    .join('');
+
   let html = `
-    <div class="video-count">🎬 ${videos.length}件の動画が見つかりました</div>
+    <div class="filter-section">
+      <input type="text" id="keywordFilter" placeholder="🔍 キーワードで検索..." class="filter-input">
+      <select id="dateFilter" class="filter-select">
+        ${dateOptions}
+      </select>
+    </div>
+    <div class="video-count">🎬 <span id="filteredCount">${videos.length}/${videos.length}件</span>の動画</div>
     <div class="select-all-row">
       <label>
         <input type="checkbox" id="selectAll" checked>
         すべて選択
       </label>
     </div>
-    <div class="video-list">
+    <div class="video-list" id="videoListContainer">
   `;
 
   videos.forEach((video, index) => {
     html += `
       <div class="video-item">
         <input type="checkbox" id="video-${index}" data-url="${video.url}" checked>
-        <label for="video-${index}" title="${video.title}">${video.title}</label>
+        <span class="video-title" data-url="${video.url}" title="${video.title}">${video.title}</span>
       </div>
     `;
   });
@@ -178,6 +339,17 @@ function renderVideoList(videos) {
   document.getElementById('selectAll').addEventListener('change', (e) => {
     const checkboxes = document.querySelectorAll('.video-item input[type="checkbox"]');
     checkboxes.forEach(cb => cb.checked = e.target.checked);
+  });
+
+  // フィルターイベント
+  document.getElementById('keywordFilter').addEventListener('input', applyFilters);
+  document.getElementById('dateFilter').addEventListener('change', applyFilters);
+
+  // タイトルクリックで動画ページを開く（バックグラウンドで開く）
+  document.querySelectorAll('.video-title').forEach(title => {
+    title.addEventListener('click', () => {
+      chrome.tabs.create({ url: title.dataset.url, active: false });
+    });
   });
 
   document.getElementById('refreshBtn').addEventListener('click', loadVideos);
@@ -237,12 +409,7 @@ async function loadVideos() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
     if (!tab.url?.includes('youtube.com')) {
-      content.innerHTML = `
-        <div class="status error">
-          YouTubeページで使用してください。<br>
-          現在のページ: ${tab.url?.substring(0, 50)}...
-        </div>
-      `;
+      showStatus(`YouTubeページで使用してください。<br>現在のページ: ${tab.url?.substring(0, 50)}...`);
       return;
     }
 
@@ -256,13 +423,7 @@ async function loadVideos() {
     renderVideoList(videos);
   } catch (error) {
     console.error('Error:', error);
-    content.innerHTML = `
-      <div class="status error">
-        動画の取得に失敗しました。<br>
-        ページを再読み込みしてお試しください。<br>
-        <small>${error.message}</small>
-      </div>
-    `;
+    showStatus(`動画の取得に失敗しました。<br>ページを再読み込みしてお試しください。<br><small>${error.message}</small>`);
   }
 }
 

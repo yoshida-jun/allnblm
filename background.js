@@ -17,12 +17,60 @@ const ArtifactType = {
   INFOGRAPHIC: 7,     // インフォグラフィック
 };
 
+// ノートブック設定パラメータ
+const NotebookParams = {
+  PROJECT_TYPE: [2],        // プロジェクトタイプ
+  FEATURE_FLAGS: [1],       // 機能フラグ
+};
+
+// 音声解説パラメータ
+const AudioParams = {
+  LENGTH_SHORT: 1,
+  LENGTH_MEDIUM: 2,
+  LENGTH_LONG: 3,
+  FORMAT_DEFAULT: 1,
+  LANGUAGE_JA: 'ja',
+};
+
+// インフォグラフィックパラメータ
+const InfographicParams = {
+  LANGUAGE_JA: 'ja',
+  ORIENTATION_DEFAULT: 1,
+  DETAIL_LEVEL: 2,
+};
+
 // 設定
 const CONFIG = {
   CONCURRENCY_LIMIT: 3,      // 同時リクエスト数
   RETRY_ATTEMPTS: 5,         // ソースID取得のリトライ回数
   RETRY_DELAY: 2000,         // リトライ間隔(ms)
   REQUEST_DELAY: 500,        // リクエスト間の遅延(ms)
+  LOG_PREFIX: '[YT2NLM]',    // ログプレフィックス
+};
+
+// 統一されたログ関数
+const log = {
+  info: (...args) => console.log(CONFIG.LOG_PREFIX, ...args),
+  error: (...args) => console.error(CONFIG.LOG_PREFIX, ...args),
+  warn: (...args) => console.warn(CONFIG.LOG_PREFIX, ...args),
+};
+
+// 認証コンテキスト（csrfToken, sessionIdをまとめて管理）
+class AuthContext {
+  constructor(csrfToken, sessionId) {
+    this.csrfToken = csrfToken;
+    this.sessionId = sessionId;
+  }
+
+  isValid() {
+    return !!this.csrfToken;
+  }
+}
+
+// ソースID配列の変換ヘルパー
+const SourceIdFormatter = {
+  toTriple: (sourceIds) => sourceIds.map(sid => [[[sid]]]),
+  toDouble: (sourceIds) => sourceIds.map(sid => [[sid]]),
 };
 
 // 並列処理を制限して実行
@@ -65,7 +113,7 @@ async function getCSRFToken() {
       sessionId: sessionMatch ? sessionMatch[1] : null
     };
   } catch (error) {
-    console.error('[YT2NLM] Failed to get CSRF token:', error);
+    log.error('Failed to get CSRF token:', error);
     return { csrfToken: null, sessionId: null };
   }
 }
@@ -88,19 +136,22 @@ function decodeRPCResponse(text) {
           if (parsed[0]?.[2]) {
             return JSON.parse(parsed[0][2]);
           }
-        } catch (e) {}
+        } catch (parseError) {
+          // 各行のパースエラーは想定内（複数行のうち一部のみが有効なJSON）
+          continue;
+        }
       }
     }
   } catch (e) {
-    console.error('[YT2NLM] Decode error:', e);
+    log.error('Decode error:', e);
   }
   return null;
 }
 
 // RPCコール実行
-async function rpcCall(method, params, csrfToken, sessionId) {
-  const url = `${BATCHEXECUTE_URL}?rpcids=${method}&source-path=/&f.sid=${sessionId || ''}&rt=c`;
-  const body = encodeRPCRequest(method, params) + `&at=${encodeURIComponent(csrfToken)}`;
+async function rpcCall(method, params, auth) {
+  const url = `${BATCHEXECUTE_URL}?rpcids=${method}&source-path=/&f.sid=${auth.sessionId || ''}&rt=c`;
+  const body = encodeRPCRequest(method, params) + `&at=${encodeURIComponent(auth.csrfToken)}`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -114,10 +165,10 @@ async function rpcCall(method, params, csrfToken, sessionId) {
 }
 
 // ノートブック作成
-async function createNotebook(title, csrfToken, sessionId) {
-  const params = [title, null, null, [2], [1]];
-  const result = await rpcCall(RPCMethod.CREATE_NOTEBOOK, params, csrfToken, sessionId);
-  console.log('[YT2NLM] Create notebook result:', result);
+async function createNotebook(title, auth) {
+  const params = [title, null, null, NotebookParams.PROJECT_TYPE, NotebookParams.FEATURE_FLAGS];
+  const result = await rpcCall(RPCMethod.CREATE_NOTEBOOK, params, auth);
+  log.info('Create notebook result:', result);
 
   if (result?.[2] && typeof result[2] === 'string') return result[2];
 
@@ -132,10 +183,10 @@ async function createNotebook(title, csrfToken, sessionId) {
 }
 
 // ノートブック情報を取得してソースIDを抽出
-async function getSourceIds(notebookId, csrfToken, sessionId) {
-  const params = [notebookId, null, [2], null, 0];
-  const result = await rpcCall(RPCMethod.GET_NOTEBOOK, params, csrfToken, sessionId);
-  console.log('[YT2NLM] Get notebook result:', JSON.stringify(result).substring(0, 500));
+async function getSourceIds(notebookId, auth) {
+  const params = [notebookId, null, NotebookParams.PROJECT_TYPE, null, 0];
+  const result = await rpcCall(RPCMethod.GET_NOTEBOOK, params, auth);
+  log.info('Get notebook result:', JSON.stringify(result).substring(0, 500));
 
   const sourceIds = [];
 
@@ -156,15 +207,15 @@ async function getSourceIds(notebookId, csrfToken, sessionId) {
   }
 
   findSourceIds(result);
-  console.log('[YT2NLM] Found source IDs:', sourceIds);
+  log.info('Found source IDs:', sourceIds);
   return sourceIds;
 }
 
 // ソースIDを期待数になるまでポーリング
-async function waitForSourceIds(notebookId, expectedCount, csrfToken, sessionId) {
+async function waitForSourceIds(notebookId, expectedCount, auth) {
   for (let i = 0; i < CONFIG.RETRY_ATTEMPTS; i++) {
-    const sourceIds = await getSourceIds(notebookId, csrfToken, sessionId);
-    console.log(`[YT2NLM] Polling ${i + 1}/${CONFIG.RETRY_ATTEMPTS}: found ${sourceIds.length}/${expectedCount} sources`);
+    const sourceIds = await getSourceIds(notebookId, auth);
+    log.info(`Polling ${i + 1}/${CONFIG.RETRY_ATTEMPTS}: found ${sourceIds.length}/${expectedCount} sources`);
 
     if (sourceIds.length >= expectedCount) {
       return sourceIds;
@@ -174,72 +225,67 @@ async function waitForSourceIds(notebookId, expectedCount, csrfToken, sessionId)
   }
 
   // 最終試行
-  return await getSourceIds(notebookId, csrfToken, sessionId);
+  return await getSourceIds(notebookId, auth);
 }
 
 // YouTubeソース追加
-async function addYouTubeSource(notebookId, url, csrfToken, sessionId) {
+async function addYouTubeSource(notebookId, url, auth) {
   const params = [
     [[null, null, null, null, null, null, null, [url], null, null, 1]],
     notebookId,
-    [2],
-    [1, null, null, null, null, null, null, null, null, null, [1]]
+    NotebookParams.PROJECT_TYPE,
+    [1, null, null, null, null, null, null, null, null, null, NotebookParams.FEATURE_FLAGS]
   ];
-  return await rpcCall(RPCMethod.ADD_SOURCE, params, csrfToken, sessionId);
+  return await rpcCall(RPCMethod.ADD_SOURCE, params, auth);
 }
 
 // 音声解説を生成
-async function createAudioOverview(notebookId, sourceIds, csrfToken, sessionId) {
-  console.log('[YT2NLM] Creating audio overview...');
-
-  const sourceIdsTriple = sourceIds.map(sid => [[[sid]]]);
-  const sourceIdsDouble = sourceIds.map(sid => [[sid]]);
+async function createAudioOverview(notebookId, sourceIds, auth) {
+  log.info('Creating audio overview...');
 
   const params = [
-    [2],
+    NotebookParams.PROJECT_TYPE,
     notebookId,
     [
       null, null,
       ArtifactType.AUDIO,
-      sourceIdsTriple,
+      SourceIdFormatter.toTriple(sourceIds),
       null, null,
       [
         null,
         [
-          null,        // instructions
-          1,           // length (1=short, 2=medium, 3=long)
           null,
-          sourceIdsDouble,
-          'ja',        // 日本語
+          AudioParams.LENGTH_SHORT,
           null,
-          1,           // format
+          SourceIdFormatter.toDouble(sourceIds),
+          AudioParams.LANGUAGE_JA,
+          null,
+          AudioParams.FORMAT_DEFAULT,
         ],
       ],
     ],
   ];
 
-  return await rpcCall(RPCMethod.CREATE_ARTIFACT, params, csrfToken, sessionId);
+  return await rpcCall(RPCMethod.CREATE_ARTIFACT, params, auth);
 }
 
 // インフォグラフィックを生成
-async function createInfographic(notebookId, sourceIds, csrfToken, sessionId) {
-  console.log('[YT2NLM] Creating infographic...');
-
-  const sourceIdsTriple = sourceIds.map(sid => [[[sid]]]);
+async function createInfographic(notebookId, sourceIds, auth) {
+  log.info('Creating infographic...');
 
   const params = [
-    [2],
+    NotebookParams.PROJECT_TYPE,
     notebookId,
     [
       null, null,
       ArtifactType.INFOGRAPHIC,
-      sourceIdsTriple,
+      SourceIdFormatter.toTriple(sourceIds),
       null, null, null, null, null, null, null, null, null, null,
-      [[null, 'ja', null, 1, 2]],  // instructions, language, orientation, detail
+      [[null, InfographicParams.LANGUAGE_JA, null, InfographicParams.ORIENTATION_DEFAULT, InfographicParams.DETAIL_LEVEL]],
     ],
   ];
 
-  return await rpcCall(RPCMethod.CREATE_ARTIFACT, params, csrfToken, sessionId);
+  return await rpcCall(RPCMethod.CREATE_ARTIFACT, params, auth);
 }
 
 // NotebookLMタブに通知を送信
@@ -250,26 +296,28 @@ async function notifyTab(notebookId, message, type = 'info') {
       chrome.tabs.sendMessage(tab.id, { action: 'showNotification', message, type }).catch(() => {});
     }
   } catch (e) {
-    console.log('[YT2NLM] Could not notify tab:', e.message);
+    log.info('Could not notify tab:', e.message);
   }
 }
 
 // メイン処理: YouTubeをNotebookLMに登録
 async function registerToNotebookLM(urls) {
-  console.log('[YT2NLM] Starting registration for', urls.length, 'URLs');
+  log.info('Starting registration for', urls.length, 'URLs');
 
   const { csrfToken, sessionId } = await getCSRFToken();
-  if (!csrfToken) {
-    console.log('[YT2NLM] CSRF token not found');
+  const auth = new AuthContext(csrfToken, sessionId);
+
+  if (!auth.isValid()) {
+    log.info('CSRF token not found');
     return { success: false, needsAuth: true };
   }
 
-  console.log('[YT2NLM] CSRF token acquired');
+  log.info('CSRF token acquired');
 
   // ノートブック作成
   const title = `YouTube動画 (${new Date().toLocaleDateString('ja-JP')})`;
-  const notebookId = await createNotebook(title, csrfToken, sessionId);
-  console.log('[YT2NLM] Created notebook:', notebookId);
+  const notebookId = await createNotebook(title, auth);
+  log.info('Created notebook:', notebookId);
 
   // ページを開く
   chrome.tabs.create({
@@ -281,8 +329,8 @@ async function registerToNotebookLM(urls) {
     try {
       // レート制限付きでソースを追加
       const tasks = urls.map(url => async () => {
-        await addYouTubeSource(notebookId, url, csrfToken, sessionId);
-        console.log('[YT2NLM] Added:', url);
+        await addYouTubeSource(notebookId, url, auth);
+        log.info('Added:', url);
         await new Promise(r => setTimeout(r, CONFIG.REQUEST_DELAY));
         return url;
       });
@@ -291,20 +339,20 @@ async function registerToNotebookLM(urls) {
       const successCount = results.filter(r => r.success).length;
       const failCount = results.filter(r => !r.success).length;
 
-      console.log(`[YT2NLM] Sources added: ${successCount} success, ${failCount} failed`);
+      log.info(`Sources added: ${successCount} success, ${failCount} failed`);
       notifyTab(notebookId, `📥 ${successCount}件のソースを追加中...`, 'info');
 
       // ポーリングでソースIDを取得
-      const sourceIds = await waitForSourceIds(notebookId, successCount, csrfToken, sessionId);
-      console.log(`[YT2NLM] Found ${sourceIds.length} source IDs`);
+      const sourceIds = await waitForSourceIds(notebookId, successCount, auth);
+      log.info(`Found ${sourceIds.length} source IDs`);
 
       if (sourceIds.length > 0) {
         notifyTab(notebookId, '🎙️ 音声解説を生成中...', 'info');
 
         // 音声解説とインフォグラフィックを並列生成
         const [audioResult, infoResult] = await Promise.allSettled([
-          createAudioOverview(notebookId, sourceIds, csrfToken, sessionId),
-          createInfographic(notebookId, sourceIds, csrfToken, sessionId),
+          createAudioOverview(notebookId, sourceIds, auth),
+          createInfographic(notebookId, sourceIds, auth),
         ]);
 
         const artifacts = [];
@@ -317,12 +365,12 @@ async function registerToNotebookLM(urls) {
           notifyTab(notebookId, '⚠️ アーティファクトの生成に失敗しました', 'warning');
         }
 
-        console.log('[YT2NLM] All artifacts processed');
+        log.info('All artifacts processed');
       } else {
         notifyTab(notebookId, '⚠️ ソースの処理中です。しばらくお待ちください', 'warning');
       }
     } catch (e) {
-      console.error('[YT2NLM] Background process error:', e);
+      log.error('Background process error:', e);
       notifyTab(notebookId, `❌ エラー: ${e.message}`, 'error');
     }
   })();
@@ -351,7 +399,7 @@ async function handleOpenNotebookLM(urls) {
       return { success: false, needsAuth: true };
     }
   } catch (error) {
-    console.error('[YT2NLM] Error:', error);
+    log.error('Error:', error);
     await chrome.storage.local.set({ pendingUrls: urls, timestamp: Date.now() });
     await chrome.tabs.create({ url: 'https://notebooklm.google.com/' });
     return { success: false, error: error.message };
@@ -360,5 +408,5 @@ async function handleOpenNotebookLM(urls) {
 
 // 拡張機能インストール時
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('YouTube to NotebookLM extension installed');
+  log.info('Extension installed');
 });
